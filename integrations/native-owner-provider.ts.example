@@ -1,0 +1,142 @@
+/**
+ * Attach this provider to an existing licensed canonical-owner host. This file
+ * contains no engine implementation and is not part of the standalone runtime.
+ */
+import type { Express } from "express";
+import { registerMigOwnerBridge, type MigOwnerBridgeHost } from "./mig-owner-bridge";
+
+export function registerNativeMigOwnerProvider(
+  app: Express,
+  config: Omit<MigOwnerBridgeHost, "dispatch">,
+): void {
+  registerMigOwnerBridge(app, {
+    ...config,
+    dispatch: async request => {
+      const args = request.args as any[];
+      if (!["catalog.read", "enterprise.listOrganizations"].includes(request.operation)) {
+        const { storage } = await import("../storage");
+        if (!(await storage.getOrganization(request.tenant_id))?.isActive) {
+          throw new Error("MIG_OWNER_TENANT_INACTIVE");
+        }
+      }
+      switch (request.operation) {
+        case "enterprise.listOrganizations": {
+          if (args.length) throw new Error("MIG_OWNER_REQUEST_INVALID");
+          const { storage } = await import("../storage");
+          const organization = await storage.getOrganization(request.tenant_id);
+          return organization ? [organization] : [];
+        }
+        case "catalog.read": {
+          const adapter = await import("./mig-bripe-adapter");
+          const { ALL_MCP_TOOLS, MCP_CAPABILITY_GROUPS } = await import("../mcp/bripe-mcp-tools");
+          const { toJsonSchemaCompat } = await import("@modelcontextprotocol/sdk/server/zod-json-schema-compat.js");
+          const tools = adapter.bripeToolCatalog();
+          const catalog = adapter.buildBripeAuthorizationCatalog();
+          const { listCapabilities } = await import("../mcp/bripe-mcp-registry-adapter");
+          const { workloadProfileRegistry } = await import("@shared/workload-profiles/registry");
+          await import("@shared/workload-profiles/index");
+          const { BYOLAB_DOMAIN_OWNER } = await import("../mcp/byolab-domain-access");
+          return {
+            tools, domains: [...catalog.domains], groups: MCP_CAPABILITY_GROUPS,
+            intents: [...catalog.intents], workloads: workloadProfileRegistry.listAll(),
+            capability_contracts: listCapabilities(),
+            restricted_callers: BYOLAB_DOMAIN_OWNER.tenantId === request.tenant_id
+              ? [{ principal_id: BYOLAB_DOMAIN_OWNER.principalId, client_id: BYOLAB_DOMAIN_OWNER.clientId }] : [],
+            capability_contract_ids: [...new Set(tools.map(t => t.capability_id))]
+              .filter(id => adapter.hasBripeCapabilityContract(id)),
+            raw_tools: ALL_MCP_TOOLS.map(tool => ({
+              name: tool.name, description: tool.description, classification: tool.classification,
+              canonical_service: tool.canonical_service,
+              inputSchema: toJsonSchemaCompat(tool.inputSchema as any,
+                { target: "jsonSchema7", pipeStrategy: "input" }),
+              outputSchema: tool.outputSchema,
+              protocolOutputSchema: tool.mcpOutputSchema ? toJsonSchemaCompat(tool.mcpOutputSchema as any,
+                { target: "jsonSchema7", pipeStrategy: "output" }) : undefined,
+            })),
+          };
+        }
+        case "tool.execute": {
+          const [name, input, context] = args;
+          if (typeof name !== "string" || !context || context.tenantId !== request.tenant_id) {
+            throw new Error("MIG_OWNER_TENANT_MISMATCH");
+          }
+          const { bripeMcpAdapter } = await import("./mig-bripe-adapter");
+          const { getMcpTool } = await import("../mcp/bripe-mcp-tools");
+          const { isByolabDomainCaller, isByolabDomainTool } = await import("../mcp/byolab-domain-access");
+          if (isByolabDomainTool(name) && !isByolabDomainCaller({
+            tenantId: request.tenant_id, principalId: context.principalId, clientId: context.migClientId,
+          })) throw new Error("MIG_OWNER_REQUEST_INVALID");
+          const tool = getMcpTool(name);
+          if (!tool) throw new Error("MIG_OWNER_REQUEST_INVALID");
+          return bripeMcpAdapter.executeTool(name, input, context);
+        }
+        case "tool.authorityAssertionInput": {
+          const { bripeMcpAdapter } = await import("./mig-bripe-adapter");
+          if (typeof args[0] !== "string" || !args[1] || typeof args[1] !== "object") {
+            throw new Error("MIG_OWNER_REQUEST_INVALID");
+          }
+          return bripeMcpAdapter.authorityAssertionInput?.(args[0], args[1]) ?? args[1];
+        }
+        case "tool.input.validate": {
+          const { getMcpTool } = await import("../mcp/bripe-mcp-tools");
+          const tool = getMcpTool(args[0]);
+          if (!tool) throw new Error("MIG_OWNER_REQUEST_INVALID");
+          return tool.inputSchema.parse(args[1]);
+        }
+        case "tool.output.validate": {
+          const { getMcpTool } = await import("../mcp/bripe-mcp-tools");
+          const tool = getMcpTool(args[0]);
+          if (!tool) throw new Error("MIG_OWNER_REQUEST_INVALID");
+          if (tool.mcpOutputSchema && !tool.mcpOutputSchema.safeParse(args[1]).success) {
+            throw new Error("MIG_OWNER_OUTPUT_CONTRACT_INVALID");
+          }
+          return { valid: true };
+        }
+        case "envelope.validate": {
+          const { validateBRIPeEnvelopeV1 } = await import("@shared/contracts/bripe-execution-v1");
+          return validateBRIPeEnvelopeV1(args[0]);
+        }
+        case "onboarding.evaluate": {
+          if (args[1] !== request.tenant_id) throw new Error("MIG_OWNER_TENANT_MISMATCH");
+          const { evaluateMigOnboardingBaseline } = await import("./mig-bripe-adapter");
+          return evaluateMigOnboardingBaseline(args[0], args[1]);
+        }
+        case "knowledge.authorizeProtectedMcpInvocation": {
+          const { authorizeProtectedMcpDispatch } = await import("./mig-protected-mcp-dispatch");
+          return authorizeProtectedMcpDispatch(args[0]);
+        }
+        case "knowledge.getGovernedKnowledgeById": {
+          const { corporateBrainKnowledgeService } = await import("../corporate-brain/knowledge-service");
+          return corporateBrainKnowledgeService.getGovernedKnowledgeById(args[0]);
+        }
+        case "enterprise.listCapabilities": {
+          if (args[0] !== request.tenant_id || args[1]?.objectType !== "Capability" ||
+              args[2] !== 5000) throw new Error("MIG_OWNER_REQUEST_INVALID");
+          const { createScopedCEOStore } = await import("../storage/canonical-enterprise-model-store");
+          return createScopedCEOStore(request.tenant_id).listEnterpriseObjects(
+            request.tenant_id, { objectType: "Capability" }, 5000);
+        }
+        default: {
+          const owner = await import("../corporate-brain/canonical-knowledge-authority-service");
+          switch (request.operation) {
+            case "knowledge.listBindings":
+              if (args[0] !== request.tenant_id) throw new Error("MIG_OWNER_TENANT_MISMATCH");
+              return owner.databaseKnowledgeAuthorityRepository.listBindings(request.tenant_id);
+            case "knowledge.bindMcpCapability":
+              return owner.canonicalKnowledgeAuthorityService.bindMcpCapability(args[0]);
+            case "knowledge.authorizeAndPersist":
+              return owner.canonicalKnowledgeAuthorityService.authorizeAndPersist(args[0], args[1], args[2], args[3]);
+            case "knowledge.recordMcpSchemaAccessAlert":
+              return owner.canonicalKnowledgeAuthorityService.recordMcpSchemaAccessAlert(args[0]);
+            case "knowledge.listMcpSchemaAccessAlerts":
+              if (args[0] !== request.tenant_id) throw new Error("MIG_OWNER_TENANT_MISMATCH");
+              return owner.canonicalKnowledgeAuthorityService.listMcpSchemaAccessAlerts(request.tenant_id);
+            case "knowledge.createMcpSchemaReviewCandidate":
+              return owner.canonicalKnowledgeAuthorityService.createMcpSchemaReviewCandidate(args[0]);
+            default: throw new Error("MIG_OWNER_REQUEST_INVALID");
+          }
+        }
+      }
+    },
+  });
+}
